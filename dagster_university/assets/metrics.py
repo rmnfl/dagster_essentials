@@ -1,4 +1,5 @@
 from dagster import asset
+from dagster_duckdb import DuckDBResource
 
 import plotly.express as px
 import plotly.io as pio
@@ -6,15 +7,12 @@ import geopandas as gpd
 import pandas as pd
 import datetime
 
-import duckdb
-import os
-
 from . import constants
 
 @asset(
     deps=["taxi_trips", "taxi_zones"]
 )
-def manhattan_stats() -> None:
+def manhattan_stats(database: DuckDBResource) -> None:
     query = """
         select
             zones.zone,
@@ -27,8 +25,8 @@ def manhattan_stats() -> None:
         group by zone, borough, geometry
     """
 
-    conn = duckdb.connect(os.getenv("DUCKDB_DATABASE"))
-    trips_by_zone = conn.execute(query).fetch_df()
+    with database.get_connection() as conn:
+        trips_by_zone = conn.execute(query).fetch_df()
 
     trips_by_zone["geometry"] = gpd.GeoSeries.from_wkt(trips_by_zone["geometry"])
     trips_by_zone = gpd.GeoDataFrame(trips_by_zone)
@@ -59,11 +57,10 @@ def manhattan_map() -> None:
 @asset(
     deps=["taxi_trips", "taxi_zones"]
 )
-def trips_by_week() -> None:
-    conn = duckdb.connect(os.getenv("DUCKDB_DATABASE"))
-
-    min_date = conn.execute("select min(pickup_datetime::date) from trips").fetchone()[0]
-    max_date = conn.execute("select max(pickup_datetime::date) from trips").fetchone()[0]
+def trips_by_week(database: DuckDBResource) -> None:
+    with database.get_connection() as conn:
+        min_date = conn.execute("select min(pickup_datetime::date) from trips").fetchone()[0]
+        max_date = conn.execute("select max(pickup_datetime::date) from trips").fetchone()[0]
 
     result = pd.DataFrame()
 
@@ -80,7 +77,8 @@ def trips_by_week() -> None:
             where date_trunc('week', pickup_datetime) = date_trunc('week', '{current_date_str}'::date)
             group by period
         """
-        week_data = conn.execute(query).fetch_df()
+        with database.get_connection() as conn:
+            week_data = conn.execute(query).fetch_df()
 
         result = pd.concat([result, week_data])
 
