@@ -1,13 +1,13 @@
-from dagster import asset
+from dagster import asset, AssetExecutionContext
 from dagster_duckdb import DuckDBResource
 
 import plotly.express as px
 import plotly.io as pio
 import geopandas as gpd
 import pandas as pd
-import datetime
 
 from . import constants
+from ..partitions import weekly_partition
 
 @asset(
     deps=["taxi_trips", "taxi_zones"]
@@ -35,7 +35,7 @@ def manhattan_stats(database: DuckDBResource) -> None:
         output_file.write(trips_by_zone.to_json())
 
 @asset(
-    deps=["manhattan_stats"],
+    deps=["manhattan_stats"]
 )
 def manhattan_map() -> None:
     trips_by_zone = gpd.read_file(constants.MANHATTAN_STATS_FILE_PATH)
@@ -55,37 +55,45 @@ def manhattan_map() -> None:
     pio.write_image(fig, constants.MANHATTAN_MAP_FILE_PATH)
 
 @asset(
-    deps=["taxi_trips", "taxi_zones"]
+    deps=["taxi_trips", "taxi_zones"],
+    partitions_def=weekly_partition
 )
-def trips_by_week(database: DuckDBResource) -> None:
-    with database.get_connection() as conn:
-        min_date = conn.execute("select min(pickup_datetime::date) from trips").fetchone()[0]
-        max_date = conn.execute("select max(pickup_datetime::date) from trips").fetchone()[0]
+def trips_by_week(context: AssetExecutionContext, database: DuckDBResource) -> None:
+    period_to_fetch = context.partition_key
 
     result = pd.DataFrame()
 
-    for current_date in [min_date + datetime.timedelta(days=x) for x in range(0, (max_date-min_date).days, 7)]:
-        current_date_str = current_date.strftime(constants.DATE_FORMAT)
-        query = f"""
-            select 
-                date_trunc('week', pickup_datetime) + interval '6 day' as period,
-                count(vendor_id) as num_trips,
-                sum(passenger_count) as passenger_count,
-                sum(trip_distance) as trip_distance,
-                sum(total_amount) as total_amount
-            from trips
-            where date_trunc('week', pickup_datetime) = date_trunc('week', '{current_date_str}'::date)
-            group by period
-        """
-        with database.get_connection() as conn:
-            week_data = conn.execute(query).fetch_df()
+    # get all trips for the week
+    query = f"""
+        select 
+            date_trunc('week', pickup_datetime) + interval '6 day' as period,
+            count(vendor_id) as num_trips,
+            sum(passenger_count) as passenger_count,
+            sum(trip_distance) as trip_distance,
+            sum(total_amount) as total_amount
+        from trips
+        where date_trunc('week', pickup_datetime) = date_trunc('week', '{period_to_fetch}'::date)
+        group by period
+    """
 
-        result = pd.concat([result, week_data])
+    with database.get_connection() as conn:
+        week_data = conn.execute(query).fetch_df()
 
+    result = pd.concat([result, week_data])
+
+    # clean up the formatting of the dataframe
+    result["period"] = period_to_fetch
     result['num_trips'] = result['num_trips'].astype('int')
     result['passenger_count'] = result['passenger_count'].astype('int')
     result['total_amount'] = result['total_amount'].round(2).astype(float)
     result['trip_distance'] = result['trip_distance'].round(2).astype(float)
     result = result.sort_values(by="period")
 
-    result.to_csv(constants.TRIPS_BY_WEEK_FILE_PATH, index=False)
+    try:
+        # If the file already exists, append to it, but replace the existing month's data
+        existing = pd.read_csv(constants.TRIPS_BY_WEEK_FILE_PATH)
+        existing = existing[existing["period"] != period_to_fetch]
+        existing = pd.concat([existing, result]).sort_values(by="period")
+        existing.to_csv(constants.TRIPS_BY_WEEK_FILE_PATH, index=False)
+    except FileNotFoundError:
+        result.to_csv(constants.TRIPS_BY_WEEK_FILE_PATH, index=False)
